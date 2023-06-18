@@ -1,0 +1,161 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: new-node-js-vm-pipeline
+  namespace: vmexamples
+spec:
+  params:
+    - description: name of the VM
+      name: vmName
+      type: string
+  tasks:
+    - name: create-vm-from-template
+      params:
+        - name: templateName
+          value: fedora-server-small-custom
+        - name: templateNamespace
+          value: openshift
+        - name: templateParams
+          value:
+            - >-
+              SSH_PUBLIC_KEY:$(tasks.generate-ssh-keys.results.publicKeySecretName)
+            - 'NAME:$(params.vmName)'
+        - name: vmNamespace
+          value: vmexamples
+        - name: startVM
+          value: 'true'
+        - name: runStrategy
+          value: ''
+        - name: dataVolumes
+          value: []
+        - name: ownDataVolumes
+          value: []
+        - name: persistentVolumeClaims
+          value: []
+        - name: ownPersistentVolumeClaims
+          value: []
+      runAfter:
+        - generate-ssh-keys
+      taskRef:
+        kind: Task
+        name: create-vm-from-template
+    - name: generate-ssh-keys
+      params:
+        - name: publicKeySecretName
+          value: ''
+        - name: publicKeySecretNamespace
+          value: ''
+        - name: privateKeySecretName
+          value: ''
+        - name: privateKeySecretNamespace
+          value: ''
+        - name: privateKeyConnectionOptions
+          value:
+            - 'user:fedora'
+            - 'disable-strict-host-key-checking:true'
+        - name: additionalSSHKeygenOptions
+          value: ''
+      taskRef:
+        kind: Task
+        name: generate-ssh-keys
+    - name: execute-in-vm
+      params:
+        - name: vmName
+          value: $(tasks.create-vm-from-template.results.name)
+        - name: vmNamespace
+          value: $(tasks.create-vm-from-template.results.namespace)
+        - name: secretName
+          value: $(tasks.generate-ssh-keys.results.privateKeySecretName)
+        - name: command
+          value: []
+        - name: args
+          value: []
+        - name: script
+          value: >-
+            sudo dnf module install nodejs -y
+
+            sudo dnf install git-all -y
+
+            sudo mkdir /var/www/node && sudo chown fedora:fedora /var/www/node
+
+            cd /var/www/node && git clone
+            https://github.com/redhat-helloworld-msa/bonjour.git
+
+            cd bonjour/
+
+            npm install
+
+            cd ~ && cat <<EOF>> node-app.service
+
+            [Unit]
+
+            Description=My application
+
+
+            [Service]
+
+            Type=simple
+
+            Restart=always
+
+            User=fedora
+
+            WorkingDirectory=/var/www/node/bonjour
+
+            ExecStart=/usr/bin/node /var/www/node/bonjour/bonjour.js
+
+
+            [Install]
+
+            WantedBy=multi-user.target
+
+            EOF
+
+            sudo cp ~/node-app.service /etc/systemd/system/
+
+            sudo systemctl start node-app.service
+      runAfter:
+        - create-vm-from-template
+      taskRef:
+        kind: Task
+        name: execute-in-vm
+    - name: create-service
+      params:
+        - name: SCRIPT
+          value: >-
+            oc create service clusterip
+            $(tasks.create-vm-from-template.results.name) --tcp=80:8080
+        - name: VERSION
+          value: latest
+      runAfter:
+        - generate-ssh-keys
+      taskRef:
+        kind: ClusterTask
+        name: openshift-client
+    - name: add-selector-to-service
+      params:
+        - name: SCRIPT
+          value: >-
+            oc set selector service
+            $(tasks.create-vm-from-template.results.name)
+            vm.kubevirt.io/name=$(tasks.create-vm-from-template.results.name)
+        - name: VERSION
+          value: latest
+      runAfter:
+        - create-service
+      taskRef:
+        kind: ClusterTask
+        name: openshift-client
+    - name: create-route
+      params:
+        - name: SCRIPT
+          value: >-
+            oc expose service $(tasks.create-vm-from-template.results.name)
+            --name=$(tasks.create-vm-from-template.results.name)
+        - name: VERSION
+          value: latest
+      runAfter:
+        - add-selector-to-service
+      taskRef:
+        kind: ClusterTask
+        name: openshift-client
